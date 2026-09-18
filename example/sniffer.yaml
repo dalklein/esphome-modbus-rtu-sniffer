@@ -1,0 +1,53 @@
+# Minimal passive Modbus RTU sniffer.
+# RX only: no tx_pin and no TX buffer, so this firmware cannot transmit onto the bus.
+esphome:
+  name: modbus-sniffer
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf        # required: read_frame() is ESP-IDF only
+
+logger:
+  level: INFO
+  baud_rate: 0           # free UART0; logs over wifi
+
+external_components:
+  - source: github://dalklein/esphome-modbus-rtu-sniffer
+    components: [modbus_rtu_sniffer]
+  # until the uart change is merged, see INSTALL.md:
+  # - source: { type: local, path: uartpatch }
+  #   components: [uart]
+
+uart:
+  - id: bus
+    rx_pin: GPIO17
+    baud_rate: 9600
+    rx_buffer_size: 1024
+    # Idle time marking a message end, in symbol times. Longer than the slowest inter-byte
+    # gap the devices emit, shorter than the inter-frame idle.
+    rx_timeout: 10
+    # Opt in to hardware frame boundaries. Without this the component will not start.
+    event_queue_size: 20
+    # Optional: above the longest message = one event per message instead of 7+1 chunks.
+    rx_full_threshold: 120
+
+modbus_rtu_sniffer:
+  id: sniff
+  uart_id: bus
+
+sensor:
+  - platform: modbus_rtu_sniffer
+    modbus_rtu_sniffer_id: sniff
+    address: 0x0F
+    register: 206
+    value_type: U_WORD
+    name: "battery soc"
+    filters:
+      - multiply: 0.1
+  - platform: modbus_rtu_sniffer
+    modbus_rtu_sniffer_id: sniff
+    address: 0x0F
+    register: 203
+    value_type: S_WORD      # signed: discharge is negative
+    name: "battery power"
