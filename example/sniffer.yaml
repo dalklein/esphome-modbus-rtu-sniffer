@@ -6,7 +6,7 @@ esphome:
 esp32:
   board: esp32dev
   framework:
-    type: esp-idf        # required: read_frame() is ESP-IDF only
+    type: esp-idf
 
 logger:
   level: INFO
@@ -15,9 +15,6 @@ logger:
 external_components:
   - source: github://dalklein/esphome-modbus-rtu-sniffer
     components: [modbus_rtu_sniffer]
-  # until the uart change is merged, see INSTALL.md:
-  # - source: { type: local, path: uartpatch }
-  #   components: [uart]
 
 uart:
   - id: bus
@@ -27,9 +24,7 @@ uart:
     # Idle time marking a message end, in symbol times. Longer than the slowest inter-byte
     # gap the devices emit, shorter than the inter-frame idle.
     rx_timeout: 10
-    # Opt in to hardware frame boundaries. Without this the component will not start.
-    event_queue_size: 20
-    # Optional: above the longest message = one event per message instead of 7+1 chunks.
+    # MUST exceed your longest frame, or frames arrive merged. See the README.
     rx_full_threshold: 120
 
 modbus_rtu_sniffer:

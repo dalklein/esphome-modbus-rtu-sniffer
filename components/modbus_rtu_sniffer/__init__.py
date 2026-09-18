@@ -10,7 +10,11 @@ sniffer_ns = cg.esphome_ns.namespace("modbus_rtu_sniffer")
 ModbusRtuSniffer = sniffer_ns.class_("ModbusRtuSniffer", cg.Component, uart.UARTDevice)
 
 CONFIG_SCHEMA = (
-    cv.Schema({cv.GenerateID(): cv.declare_id(ModbusRtuSniffer)})
+    cv.Schema(
+        {
+            cv.GenerateID(): cv.declare_id(ModbusRtuSniffer),
+        }
+    )
     .extend(cv.COMPONENT_SCHEMA)
     .extend(uart.UART_DEVICE_SCHEMA)
 )

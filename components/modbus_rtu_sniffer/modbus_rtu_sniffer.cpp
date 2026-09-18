@@ -26,45 +26,38 @@ void ModbusRtuSniffer::setup() {
   // UART_INTR_RXFIFO_TOUT from its own `rx_timeout:` (symbol times), and -- when
   // `event_queue_size:` is set -- keeps the event queue that records where each
   // frame ended. All we do is ask for the result.
-  this->ok_ = this->parent_->supports_frame_reads();
-  if (!this->ok_) {
-    ESP_LOGE(TAG,
-             "this uart cannot supply frames. On esp-idf set 'event_queue_size: 20' on the "
-             "uart, and 'rx_timeout: 3' or more for a Modbus RTU inter-frame gap.");
-    this->mark_failed();
-    return;
+  this->ok_ = true;
+  if (this->parent_->get_rx_full_threshold() < 64) {
+    ESP_LOGW(TAG,
+             "rx_full_threshold is %u. It must exceed the longest BURST on your bus -- a request "
+             "and its reply arrive together when rx_timeout exceeds the turnaround. Below that, "
+             "frames WILL be delivered merged or split. Set it to 120 unless your bursts are longer.",
+             (unsigned) this->parent_->get_rx_full_threshold());
   }
   ESP_LOGI(TAG, "bound sensors: %u", (unsigned) this->sensors_.size());
-  ESP_LOGI(TAG, "listening via uart read_frame(), rx_timeout=%u symbols",
+  ESP_LOGI(TAG, "listening, rx_timeout=%u symbols",
            (unsigned) this->parent_->get_rx_timeout());
 }
 
 void ModbusRtuSniffer::loop() {
   if (!this->ok_)
     return;
-  // Each successful read_frame() is ONE hardware-delimited chunk. Overrun handling and
-  // flushing now live in the uart component, which is the point: this component carries
-  // no platform code.
-  while (this->parent_->read_frame(this->frame_buf_)) {
-    if (!this->frame_buf_.empty())
-      this->split_and_handle_(this->frame_buf_.data(), this->frame_buf_.size());
-  }
+  // Read whatever the uart has and split it by declared length and CRC. An incomplete tail is
+  // carried to the next iteration rather than discarded -- see loop_poll_().
+  this->loop_poll_();
+
   const uint32_t now = millis();
   if (now - this->last_report_ > 10000) {
     this->last_report_ = now;
     ESP_LOGI(TAG,
              "stats: frames=%" PRIu32 " crc_ok=%" PRIu32 " crc_bad=%" PRIu32 " | req=%" PRIu32
-             " rsp=%" PRIu32 " orphan=%" PRIu32 " mismatch=%" PRIu32 " resync=%" PRIu32 " | ev1=%" PRIu32 " evN=%" PRIu32 " | overrun=%" PRIu32
+             " rsp=%" PRIu32 " orphan=%" PRIu32 " mismatch=%" PRIu32 " resync=%" PRIu32 " | ev1=%" PRIu32 " evN=%" PRIu32 " | pollcarry=%" PRIu32 " pollflush=%" PRIu32 " | overrun=%" PRIu32
              " line_err=%" PRIu32,
              this->frames_, this->crc_ok_, this->crc_bad_, this->req_, this->rsp_, this->orphan_,
-             this->mismatched_, this->resync_, this->ev_single_, this->ev_merged_, this->overruns_, this->brk_);
+             this->mismatched_, this->resync_, this->ev_single_, this->ev_merged_, this->poll_carried_, this->poll_flushes_, this->overruns_, this->brk_);
     // Confirms uart_set_always_rx_timeout() actually armed: with it armed EVERY burst ends on a
     // line-idle boundary, so timeout_events == frames. Materially fewer means boundaries are
     // still being missed. The IDF call returns void, so this is the only way to know.
-    const auto fs = this->parent_->get_frame_stats();
-    ESP_LOGI(TAG, "uart events: data=%" PRIu32 " timeout=%" PRIu32 " | overrun=%" PRIu32
-                  " desync=%" PRIu32,
-             fs.data_events, fs.timeout_events, fs.overruns, fs.desyncs);
     const uint32_t min_us = (uint32_t) (35ULL * 1000000ULL / this->parent_->get_baud_rate());
     for (auto &kv : this->turn_) {
       auto &t = kv.second;
@@ -256,11 +249,100 @@ void ModbusRtuSniffer::publish_(uint8_t address, uint16_t reg, uint16_t raw) {
 }
 
 void ModbusRtuSniffer::dump_config() {
-  ESP_LOGCONFIG(TAG, "Modbus sniffer (uart read_frame API)");
+  ESP_LOGCONFIG(TAG, "Modbus RTU sniffer (passive)");
   ESP_LOGCONFIG(TAG, "  Baud: %" PRIu32 ", rx_timeout: %u symbols (~%.1f ms)",
                 this->parent_->get_baud_rate(), (unsigned) this->parent_->get_rx_timeout(),
                 this->parent_->get_rx_timeout() * 10000.0f / this->parent_->get_baud_rate());
   ESP_LOGCONFIG(TAG, "  Sensors: %u", (unsigned) this->sensors_.size());
+}
+
+
+// ---------------------------------------------------------------------------------------
+// EXPERIMENT: acquire bytes the way a component does today against stock uart.
+//
+// Fairness matters here. A naive version -- read whatever is available, split it, discard the
+// rest -- would fail by construction the moment a frame is half-arrived, which would prove
+// nothing. A real component keeps the incomplete tail, so this does too. The buffer is dropped
+// only after a silence gap with nothing parseable in it, which is the honest failure signal.
+// ---------------------------------------------------------------------------------------
+size_t ModbusRtuSniffer::parse_prefix_(const uint8_t *b, size_t n) {
+  size_t i = 0;
+  uint32_t found = 0;
+  while (i + 4 <= n) {
+    const uint8_t fn = b[i + 1];
+    bool matched = false, need_more = false;
+
+    if (fn == 0x03 || fn == 0x04) {
+      if (i + 8 <= n) {                                  // REQUEST: fixed 8 bytes
+        const uint16_t calc = crc16_modbus(b + i, 6);
+        const uint16_t seen = (uint16_t) b[i + 6] | ((uint16_t) b[i + 7] << 8);
+        if (calc == seen) {
+          this->frames_++; found++;
+          this->handle_frame_(b + i, 8);
+          i += 8; matched = true;
+        }
+      } else {
+        need_more = true;
+      }
+      if (!matched) {                                    // RESPONSE: 5 + byte count
+        const size_t rlen = 5 + (size_t) b[i + 2];
+        if (i + rlen <= n) {
+          const uint16_t calc = crc16_modbus(b + i, rlen - 2);
+          const uint16_t seen = (uint16_t) b[i + rlen - 2] | ((uint16_t) b[i + rlen - 1] << 8);
+          if (calc == seen) {
+            this->frames_++; found++;
+            this->handle_frame_(b + i, rlen);
+            i += rlen; matched = true;
+          }
+        } else if (rlen <= 260) {
+          need_more = true;
+        }
+      }
+    }
+
+    if (matched)
+      continue;
+    // Only wait for more if a plausible frame could still complete. Beyond the longest frame
+    // this bus produces, waiting forever would hide a desync rather than report it.
+    if (need_more && (n - i) < 64)
+      break;
+    this->resync_++;
+    i++;
+  }
+  if (found == 1) this->ev_single_++;
+  else if (found > 1) this->ev_merged_++;
+  return i;
+}
+
+void ModbusRtuSniffer::loop_poll_() {
+  const uint32_t now = millis();
+  bool got = false;
+  while (this->available()) {
+    uint8_t byte;
+    if (!this->read_byte(&byte))
+      break;
+    this->poll_accum_.push_back(byte);
+    got = true;
+  }
+  if (got)
+    this->poll_last_rx_ = now;
+  if (this->poll_accum_.empty())
+    return;
+
+  const size_t used = this->parse_prefix_(this->poll_accum_.data(), this->poll_accum_.size());
+  if (used > 0)
+    this->poll_accum_.erase(this->poll_accum_.begin(), this->poll_accum_.begin() + used);
+
+  if (this->poll_accum_.empty())
+    return;
+  // Something is left over. Either a frame is still arriving (fine, carry it), or the buffer
+  // has desynced and will never parse (drop it after a silence, and COUNT that).
+  if (now - this->poll_last_rx_ > 50) {
+    this->poll_flushes_++;
+    this->poll_accum_.clear();
+  } else {
+    this->poll_carried_++;
+  }
 }
 
 }  // namespace modbus_rtu_sniffer

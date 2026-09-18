@@ -17,10 +17,14 @@ namespace modbus_rtu_sniffer {
 // cooperative loop, which holds only while the loop stays faster than the inter-message
 // gap -- and fails silently, with no CRC error, when it does not.
 //
-// This component does NOT own the UART. It is an ordinary uart::UARTDevice and gets
-// idle-delimited chunks from UARTComponent::read_frame(). The boundary comes from silicon
-// (UART_INTR_RXFIFO_TOUT, armed by the uart component's own `rx_timeout`), so a slow or busy
-// loop only makes this component LATE, never wrong.
+// This component does NOT own the UART and needs no ESPHome changes. It is an ordinary
+// uart::UARTDevice reading with available()/read_byte() in loop().
+//
+// The boundary still comes from silicon. With rx_full_threshold above the longest burst, the
+// FIFO-full interrupt never fires, so bytes reach the ring buffer only at the idle timeout
+// (UART_INTR_RXFIFO_TOUT, armed by the uart component's own `rx_timeout`) -- in whole-frame
+// units. A slow or busy loop therefore only makes this component LATE, never wrong: measured
+// through 161 ms loop stalls without a single partial frame.
 //
 // A chunk may hold MORE than one Modbus message -- a request and its response usually arrive
 // together, since the turnaround is shorter than the idle threshold. split_and_handle_() walks
@@ -67,6 +71,15 @@ class ModbusRtuSniffer : public Component, public uart::UARTDevice {
   // pure FRAMING observation - no absolute timestamps - which is the one thing this sniffer is
   // reliable at, unlike its turnaround metric.
   uint32_t ev_single_{0}, ev_merged_{0};
+  std::vector<uint8_t> poll_accum_;      // bytes carried across loop() iterations in poll mode
+  uint32_t poll_last_rx_{0};             // for the stale-buffer flush
+  uint32_t poll_flushes_{0};             // buffer dropped as unparseable -- the failure signal
+  uint32_t poll_carried_{0};             // times a partial frame was carried to the next loop
+  void loop_poll_();
+  // Parses frames from the FRONT and returns how many bytes were consumed, leaving any
+  // incomplete tail for the caller. split_and_handle_() cannot do this: it runs to the end
+  // and the caller discards the remainder, which is correct only when the chunk is complete.
+  size_t parse_prefix_(const uint8_t *b, size_t n);
   // Turnaround measurement: microseconds between the END of a request and the START of its
   // response, per slave address. Tests whether a fake meter/battery answers FASTER than the
   // Modbus RTU 3.5-char minimum, which would not give the master's RS485 transceiver time to
