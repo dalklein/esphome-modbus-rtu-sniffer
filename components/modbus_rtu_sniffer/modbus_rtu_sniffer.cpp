@@ -1,5 +1,6 @@
 #include "modbus_rtu_sniffer.h"
 #ifdef USE_ESP32
+#include "esphome/components/modbus/modbus_helpers.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include <driver/gpio.h>
@@ -17,6 +18,18 @@ static const size_t MAX_FRAME = 256;
 // sniffer that rolled its own could only ever drift away from the thing it is watching.
 // Verified identical to the previous local implementation against the standard
 // "123456789" -> 0x4B37 vector and 200,000 random frames, 0 mismatches.
+// Frame geometry and field extraction come from core's modbus_helpers.h. That header is
+// deliberately standalone -- it pulls in modbus_definitions.h and core helpers, NOT the
+// Modbus class -- so a passive listener can use the same length and layout rules the real
+// component uses, rather than a private copy that can only drift away from it.
+using modbus::helpers::client_frame_length;
+using modbus::helpers::client_pdu_start_address;
+using modbus::helpers::get_data;
+using modbus::helpers::is_server_pdu_standard;
+using modbus::helpers::pdu_function_code;
+using modbus::helpers::server_frame_length;
+using modbus::helpers::server_pdu_payload;
+
 static inline uint16_t crc16_modbus(const uint8_t *d, size_t len) {
   return crc16(d, (uint16_t) len);
 }
@@ -84,6 +97,17 @@ void ModbusRtuSniffer::loop() {
 // If neither validates at this offset, advance one byte and resynchronise. That is cheap
 // (a CRC over <=8 bytes) and self-correcting, and it makes the parser independent of how
 // many frames happen to arrive in one event.
+// Smallest legal RTU frame: address + fc + CRC.
+static const size_t MIN_ADU = 4;
+
+// CRC over everything but the trailing little-endian CRC pair.
+static inline bool crc_ok_at_(const uint8_t *f, size_t len) {
+  if (len < MIN_ADU)
+    return false;
+  const uint16_t seen = (uint16_t) f[len - 2] | ((uint16_t) f[len - 1] << 8);
+  return crc16_modbus(f, len - 2) == seen;
+}
+
 void ModbusRtuSniffer::split_and_handle_(const uint8_t *b, size_t n) {
   size_t i = 0;
   uint32_t found = 0;
@@ -92,31 +116,35 @@ void ModbusRtuSniffer::split_and_handle_(const uint8_t *b, size_t n) {
     bool matched = false;
 
     if (fn == 0x03 || fn == 0x04) {
-      // try REQUEST (fixed 8 bytes)
-      if (i + 8 <= n) {
-        uint16_t calc = crc16_modbus(b + i, 6);
-        uint16_t seen = (uint16_t) b[i + 6] | ((uint16_t) b[i + 7] << 8);
-        if (calc == seen) {
+      // Lengths come from core. For fc3/fc4 client_frame_length() is the fixed 8 and
+      // server_frame_length() reads the byte count -- the same two rules as before, but
+      // now the ones the real modbus component applies.
+      const size_t avail = n - i;
+
+      // try REQUEST
+      const size_t qlen = client_frame_length(b + i, avail);
+      // Deliberately NOT is_client_pdu_standard() here. It would additionally bound the
+      // quantity and the start+count arithmetic -- more correct, but validation the old
+      // splitter never did, and a rejected REQUEST costs the pairing for its response
+      // (it would surface as orphan++). Kept behaviour-identical; the length is fixed at
+      // 8 and CRC-checked, and a response can never be 8 bytes, so there is no ambiguity.
+      if (qlen >= MIN_ADU && i + qlen <= n && crc_ok_at_(b + i, qlen)) {
+        this->frames_++;
+        found++;
+        this->handle_frame_(b + i, qlen);
+        i += qlen;
+        matched = true;
+      }
+      // try RESPONSE
+      if (!matched) {
+        const size_t rlen = server_frame_length(b + i, avail);
+        if (rlen >= MIN_ADU && i + rlen <= n && crc_ok_at_(b + i, rlen) &&
+            is_server_pdu_standard(b + i + 1, rlen - 3)) {
           this->frames_++;
           found++;
-          this->handle_frame_(b + i, 8);
-          i += 8;
+          this->handle_frame_(b + i, rlen);
+          i += rlen;
           matched = true;
-        }
-      }
-      // try RESPONSE (5 + bytecount)
-      if (!matched) {
-        const size_t rlen = 5u + b[i + 2];
-        if (b[i + 2] > 0 && (b[i + 2] & 1) == 0 && i + rlen <= n) {
-          uint16_t calc = crc16_modbus(b + i, rlen - 2);
-          uint16_t seen = (uint16_t) b[i + rlen - 2] | ((uint16_t) b[i + rlen - 1] << 8);
-          if (calc == seen) {
-            this->frames_++;
-            found++;
-            this->handle_frame_(b + i, rlen);
-            i += rlen;
-            matched = true;
-          }
         }
       }
     }
@@ -161,15 +189,20 @@ void ModbusRtuSniffer::handle_frame_(const uint8_t *f, size_t len) {
   this->crc_ok_++;
 
   const uint8_t addr = f[0];
-  const uint8_t fn = f[1];
+  // PDU is the frame minus the address byte and the trailing CRC.
+  const std::span<const uint8_t> pdu(f + 1, len - 3);
+  const uint8_t fn = pdu_function_code(pdu);
   if (fn != 0x03 && fn != 0x04)
     return;  // only holding/input register reads carry register data
 
   if (len == 8) {
     // REQUEST
+    const auto start = client_pdu_start_address(pdu);
+    if (!start.has_value())
+      return;  // core declines to read an address out of this layout; do not guess one
     Pending p;
-    p.start = ((uint16_t) f[2] << 8) | f[3];
-    p.count = ((uint16_t) f[4] << 8) | f[5];
+    p.start = *start;
+    p.count = get_data<uint16_t>(pdu.data(), 3);
     p.valid = true;
     this->pending_[addr] = p;
     this->req_++;
@@ -227,10 +260,16 @@ void ModbusRtuSniffer::handle_frame_(const uint8_t *f, size_t len) {
       return;
     }
     const uint16_t start = it->second.start;
-    for (uint16_t i = 0; i < count; i++) {
-      uint16_t raw = ((uint16_t) f[3 + 2 * i] << 8) | f[4 + 2 * i];
-      this->publish_(addr, start + i, raw);
+    // server_pdu_payload() steps over the function code AND the byte count for read
+    // responses, so this is the register data with no offset arithmetic of our own.
+    const auto payload = server_pdu_payload(pdu);
+    if (payload.size() < (size_t) count * 2) {
+      this->mismatched_++;
+      it->second.valid = false;
+      return;
     }
+    for (uint16_t i = 0; i < count; i++)
+      this->publish_(addr, start + i, get_data<uint16_t>(payload.data(), 2 * i));
     // Consume it: one request yields exactly one response.
     it->second.valid = false;
   }

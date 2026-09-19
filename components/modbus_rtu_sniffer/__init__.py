@@ -5,6 +5,11 @@ from esphome.const import CONF_ID
 
 CODEOWNERS = ["@dalklein"]
 DEPENDENCIES = ["uart"]
+# AUTO_LOAD, not DEPENDENCIES: this uses modbus's frame-geometry helpers
+# (modbus_helpers.h) but needs no `modbus:` block of its own, and a sniffer user should
+# not have to configure one. The helpers are mostly header-inline, and unused modbus code
+# is dropped by --gc-sections.
+AUTO_LOAD = ["modbus"]
 
 sniffer_ns = cg.esphome_ns.namespace("modbus_rtu_sniffer")
 ModbusRtuSniffer = sniffer_ns.class_("ModbusRtuSniffer", cg.Component, uart.UARTDevice)
