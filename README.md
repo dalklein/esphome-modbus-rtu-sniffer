@@ -36,7 +36,7 @@ rx_full_threshold=120  ->  ev1=2989  evN=1        (one frame per read)
 
 With the threshold raised, `RXFIFO_FULL` never fires, so bytes reach the ring buffer only at the
 idle timeout — in whole-frame units. That holds **regardless of how busy the loop is**: measured on
-a board also running a Modbus master and a second protocol on another UART, with 25% of seconds
+a board also running a Modbus client and a second protocol on another UART, with 25% of seconds
 containing a loop iteration of 144–161 ms against a 28.3 ms inter-frame gap, across ~14,000 frames
 the parser never once saw a partial frame.
 
@@ -71,7 +71,7 @@ modbus_rtu_sniffer:
 sensor:
   - platform: modbus_rtu_sniffer
     modbus_rtu_sniffer_id: sniff
-    address: 0x0F           # the slave whose replies you want
+    address: 0x0F           # the server whose replies you want
     register: 206
     value_type: U_WORD      # or S_WORD
     name: "battery soc"
